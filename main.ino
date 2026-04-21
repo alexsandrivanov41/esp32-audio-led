@@ -1,6 +1,26 @@
 // ============================================================================
-// ESP32-WROVER-B Audio Streamer v3.0 — FINAL OPTIMIZED
-// ✅ 3-LED WS2812B | I2S Fix | WDT Fix | No mDNS | Minified HTML
+// ESP32-WROVER-B Audio Streamer v3.0 — РЕКОНСТРУИРОВАННАЯ ВЕРСИЯ
+// ============================================================================
+// Функционал:
+//   • Двусторонняя аудиосвязь через I2S (приём/передача @ 16kHz, 32-bit)
+//   • WebSocket клиент для сигнализации с сервером
+//   • RTP/UDP потоковая передача аудио с поддержкой шифрования AES-128-CBC
+//   • Веб-интерфейс конфигурации (AP режим + STA режим)
+//   • Энергонезависимое хранение настроек в EEPROM (2KB)
+//   • WS2812B LED-индикация (3 светодиода): режим, WS-статус, запись
+//   • Тактовая кнопка: короткое нажатие — запись, долгое — смена режима
+//   • SHA-256 хеширование паролей, генерация PSK-ключа
+//
+// Оптимизации v3.0:
+//   ✅ mDNS отключён (экономия ~18KB RAM)
+//   ✅ Исправлен конфликт инициализации I2S драйверов
+//   ✅ Watchdog Timer настроен для Core 3.x
+//   ✅ HTML минифицирован и помещён в PROGMEM
+//   ✅ IV для AES в Big-Endian формате
+//   ✅ SSRC передаётся в RTP заголовке и WebSocket
+//
+// Аппаратная платформа: ESP32-WROVER-B (с PSRAM)
+// Требуемые библиотеки: FastLED, WebSocketsClient, ArduinoJson
 // ============================================================================
 
 #include <Arduino.h>
@@ -11,244 +31,334 @@
 #include <EEPROM.h>
 #include <driver/i2s.h>
 #include <esp_task_wdt.h>
-// #include <ESPmDNS.h>  // ⚠️ mDNS ОТКЛЮЧЕН (экономия ~18KB)
+// #include <ESPmDNS.h>  // ⚠️ ОТКЛЮЧЕН для экономии памяти
 #include <mbedtls/aes.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
 #include <FastLED.h>
 
+// Макрос логирования с временной меткой
 #define LOG(fmt, ...) Serial.printf("[%7lu] " fmt "\n", millis(), ##__VA_ARGS__)
 
-// ==================== КОНФИГУРАЦИЯ ====================
-const char* AP_SSID = "ESP32-Audio";
-const char* AP_PASS = "12345678";
-const char* DEFAULT_HOSTNAME = "esp32-audio";
-const char* DEFAULT_SERVER_HOST = "192.168.50.54";
-const int DEFAULT_SERVER_WS_PORT = 8080;
-const int DEFAULT_SERVER_UDP_PORT = 5004;
-const char* DEFAULT_SIGNALING_PATH = "/signaling";
-const char* DEFAULT_WEB_USER = "admin";
-const char* DEFAULT_WEB_PASS = "admin123";
-const bool DEFAULT_SSL_ENABLED = false;
+// ==================== КОНФИГУРАЦИЯ ПО УМОЛЧАНИЮ ====================
+// Точки доступа и учётные данные
+const char* AP_SSID = "ESP32-Audio";           // SSID режима точки доступа
+const char* AP_PASS = "12345678";              // Пароль режима точки доступа
+const char* DEFAULT_HOSTNAME = "esp32-audio";  // Имя устройства по умолчанию
+const char* DEFAULT_SERVER_HOST = "192.168.50.54";  // IP сервера сигнализации
+const int DEFAULT_SERVER_WS_PORT = 8080;       // WebSocket порт сервера
+const int DEFAULT_SERVER_UDP_PORT = 5004;      // UDP порт для RTP аудио
+const char* DEFAULT_SIGNALING_PATH = "/signaling";  // Путь WebSocket endpoint
+const char* DEFAULT_WEB_USER = "admin";        // Пользователь веб-интерфейса
+const char* DEFAULT_WEB_PASS = "admin123";     // Пароль веб-интерфейса по умолчанию
+const bool DEFAULT_SSL_ENABLED = false;        // Шифрование AES выключено по умолчанию
 
-// ==================== ПИНЫ ====================
-#define I2S_IN_WS      22
-#define I2S_IN_SD      21
-#define I2S_IN_SCK     23
+// ==================== АППАРАТНЫЕ ПИНЫ ====================
+// I2S вход (микрофон/линейный вход)
+#define I2S_IN_WS      22   // Word Select (LRCLK)
+#define I2S_IN_SD      21   // Serial Data (ADC output)
+#define I2S_IN_SCK     23   // Bit Clock (BCLK)
 #define I2S_IN_PORT    I2S_NUM_0
 
-#define I2S_OUT_BCK    26
-#define I2S_OUT_LRC    27
-#define I2S_OUT_DATA   25
+// I2S выход (ЦАП/усилитель)
+#define I2S_OUT_BCK    26   // Bit Clock
+#define I2S_OUT_LRC    27   // Left/Right Clock
+#define I2S_OUT_DATA   25   // Serial Data to DAC
 #define I2S_OUT_PORT   I2S_NUM_1
 
-#define BUTTON_PIN          4
-#define BUTTON_PULLUP       true
-#define BUTTON_DEBOUNCE_MS  50
-#define BUTTON_LONG_PRESS_MS 1000
+// Кнопка управления
+#define BUTTON_PIN          4   // GPIO кнопки
+#define BUTTON_PULLUP       true  // Внутренний pull-up резистор
+#define BUTTON_DEBOUNCE_MS  50    // Время антидребезга (мс)
+#define BUTTON_LONG_PRESS_MS 1000 // Длительное нажатие (мс)
 
-#define LED_PIN         2
-#define NUM_LEDS        3
-#define LED_BRIGHTNESS  64
+// WS2812B LED лента
+#define LED_PIN         2   // GPIO данных
+#define NUM_LEDS        3   // Количество светодиодов
+#define LED_BRIGHTNESS  64  // Яркость (0-255)
 
-// LED индексы
-#define LED_STATUS      0   // Режим: ⚪Idle/🟢Play/🔴Rec
-#define LED_WS          1   // WS: 🟦Conn/🟡Disc
-#define LED_RECORD      2   // Rec/Play: 🔴Rec/🟢Play/⚫Off
+// Индексы светодиодов и их назначение:
+#define LED_STATUS      0   // Режим работы: ⚪Idle / 🟢Play / 🔴Rec
+#define LED_WS          1   // WebSocket: 🟦Connected / 🟡Disconnected
+#define LED_RECORD      2   // Запись/Воспроизведение: 🔴Rec / 🟢Play / ⚫Off
 
-// ==================== АУДИО ====================
-#define SAMPLE_RATE 16000
-#define BUFFER_SIZE 512
-#define RTP_SSRC    1       // ✅ SSRC для RTP и WS
+// ==================== АУДИО ПАРАМЕТРЫ ====================
+#define SAMPLE_RATE 16000     // Частота дискретизации (Гц)
+#define BUFFER_SIZE 512       // Размер аудио буфера (сэмплы)
+#define RTP_SSRC    1         // SSRC идентификатор для RTP и WebSocket
 
-// ==================== EEPROM ====================
+// ==================== EEPROM РАЗМЕТКА ====================
+// Общий размер: 2048 байт
 #define EEPROM_SIZE 2048
-#define EEPROM_MAGIC 0x43
-#define EEPROM_HOSTNAME_ADDR 10
-#define EEPROM_WIFI_SSID_ADDR 42
-#define EEPROM_WIFI_PASS_ADDR 106
-#define EEPROM_SERVER_HOST_ADDR 170
-#define EEPROM_SERVER_WS_PORT_ADDR 234
-#define EEPROM_SERVER_UDP_PORT_ADDR 236
-#define EEPROM_SIGNALING_PATH_ADDR 238
-#define EEPROM_WEB_USER_ADDR 270
-#define EEPROM_WEB_PASS_ADDR 334
-#define EEPROM_WEB_PASS_HASH_ADDR 398
-#define EEPROM_SSL_ENABLED_ADDR 462
-#define EEPROM_PSK_ADDR 463
-#define EEPROM_PSK_HEX_ADDR 495
+#define EEPROM_MAGIC 0x43     // Магическое число валидности конфигурации
 
-#define PSK_LEN 32
-#define HASH_LEN 32
-#define PSK_HEX_LEN (PSK_LEN * 2 + 1)
+// Адреса хранения параметров (смещение от начала EEPROM):
+#define EEPROM_HOSTNAME_ADDR      10    // 32 байта: имя устройства
+#define EEPROM_WIFI_SSID_ADDR     42    // 64 байта: SSID WiFi
+#define EEPROM_WIFI_PASS_ADDR     106   // 64 байта: пароль WiFi
+#define EEPROM_SERVER_HOST_ADDR   170   // 64 байта: IP сервера
+#define EEPROM_SERVER_WS_PORT_ADDR 234  // 2 байта: WS порт (little-endian)
+#define EEPROM_SERVER_UDP_PORT_ADDR 236 // 2 байта: UDP порт (little-endian)
+#define EEPROM_SIGNALING_PATH_ADDR 238  // 32 байта: путь сигнализации
+#define EEPROM_WEB_USER_ADDR      270   // 32 байта: пользователь веб
+#define EEPROM_WEB_PASS_ADDR      334   // 32 байта: пароль веб (открытый текст)
+#define EEPROM_WEB_PASS_HASH_ADDR 398   // 32 байта: SHA-256 хеш пароля
+#define EEPROM_SSL_ENABLED_ADDR   462   // 1 байт: флаг шифрования
+#define EEPROM_PSK_ADDR           463   // 32 байта: AES ключ (binary)
+#define EEPROM_PSK_HEX_ADDR       495   // 65 байт: AES ключ (hex строка)
 
-// ==================== РЕЖИМЫ ====================
-enum DeviceMode { MODE_IDLE = 0, MODE_PLAYBACK };
+// Криптографические константы:
+#define PSK_LEN      32   // Длина PSK ключа (256 бит / 32 байта)
+#define HASH_LEN     32   // Длина SHA-256 хеша (32 байта)
+#define PSK_HEX_LEN  65   // Hex представление PSK (64 символа + null)
 
-// ==================== ГЛОБАЛЬНЫЕ ====================
-CRGB leds[NUM_LEDS];
-WebSocketsClient webSocket;
-WiFiUDP udp;
-WebServer server(80);
+// ==================== РЕЖИМЫ РАБОТЫ ====================
+enum DeviceMode { 
+    MODE_IDLE = 0,      // Ожидание, запись возможна
+    MODE_PLAYBACK       // Воспроизведение входящего аудио
+};
+
+// ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
+// LED управление
+CRGB leds[NUM_LEDS];  // Массив светодиодов FastLED
+
+// Сетевые клиенты
+WebSocketsClient webSocket;  // WebSocket клиент для сигнализации
+WiFiUDP udp;                 // UDP сокет для RTP аудио
+WebServer server(80);        // HTTP сервер конфигурации
+
+// Аудио буфер (выделяется динамически из PSRAM или heap)
 uint8_t* i2s_buffer = nullptr;
 
-static uint32_t session_start = 0;
-#define SESSION_TIMEOUT 3600000UL
+// Сессия веб-интерфейса
+static uint32_t session_start = 0;          // Время начала сессии (millis)
+#define SESSION_TIMEOUT 3600000UL           // Таймаут сессии: 1 час
 
-volatile bool is_recording = false;
-volatile uint32_t recording_start_time = 0;
-volatile DeviceMode device_mode = MODE_IDLE;
+// Состояние записи и режима
+volatile bool is_recording = false;                  // Флаг активной записи
+volatile uint32_t recording_start_time = 0;          // Время начала записи
+volatile DeviceMode device_mode = MODE_IDLE;         // Текущий режим устройства
 
+// Структура состояния LED для неблокирующего обновления
 struct LedState {
-    bool ws_connected;
-    bool recording;
-    bool recording_blink;
-    uint32_t recording_blink_time;
-    uint32_t ws_blink_time;
-    bool ws_blink_state;
+    bool ws_connected;           // WebSocket подключён
+    bool recording;              // Идёт запись
+    bool recording_blink;        // Текущее состояние мигания записи
+    uint32_t recording_blink_time;  // Время последнего переключения записи
+    uint32_t ws_blink_time;      // Время последнего переключения WS
+    bool ws_blink_state;         // Текущее состояние мигания WS
 } led_state;
 
-volatile bool button_pressed = false;
-volatile bool button_long_press = false;
-bool button_state = HIGH;
-uint32_t last_button_time = 0;
-uint32_t button_press_start = 0;
+// Кнопка: состояние и тайминги
+volatile bool button_pressed = false;     // Факт нажатия
+volatile bool button_long_press = false;  // Долгое нажатие распознано
+bool button_state = HIGH;                 // Текущее чтение GPIO
+uint32_t last_button_time = 0;            // Время последнего изменения
+uint32_t button_press_start = 0;          // Время начала нажатия
 
+// Криптографический контекст AES
 mbedtls_aes_context dtls_aes_ctx;
 
+// Структура конфигурации (хранится в RAM, синхронизируется с EEPROM)
 struct Config {
-    uint8_t magic;
-    char hostname[32];
-    char wifi_ssid[64];
-    char wifi_pass[64];
-    char server_host[64];
-    int server_ws_port;
-    int server_udp_port;
-    char signaling_path[32];
-    char web_user[32];
-    char web_pass[32];
-    uint8_t web_pass_hash[HASH_LEN];
-    bool ssl_enabled;
-    uint8_t psk[PSK_LEN];
-    char psk_hex[PSK_HEX_LEN];
+    uint8_t magic;                    // Магическое число валидности
+    char hostname[32];                // Имя устройства
+    char wifi_ssid[64];               // SSID WiFi сети
+    char wifi_pass[64];               // Пароль WiFi
+    char server_host[64];             // IP/hostname сервера
+    int server_ws_port;               // Порт WebSocket
+    int server_udp_port;              // Порт UDP для RTP
+    char signaling_path[32];          // Путь WebSocket endpoint
+    char web_user[32];                // Пользователь веб-интерфейса
+    char web_pass[32];                // Пароль (открытый текст, для совместимости)
+    uint8_t web_pass_hash[HASH_LEN];  // SHA-256 хеш пароля
+    bool ssl_enabled;                 // Флаг шифрования AES
+    uint8_t psk[PSK_LEN];             // AES ключ (binary)
+    char psk_hex[PSK_HEX_LEN];        // AES ключ (hex строка)
 } config;
 
-volatile uint32_t packets_sent = 0;
-volatile uint32_t bytes_sent = 0;
-volatile uint32_t encrypted_packets = 0;
-uint32_t rtp_seq = 0;
-uint32_t rtp_ts = 0;
+// Статистика передачи
+volatile uint32_t packets_sent = 0;    // Отправлено RTP пакетов
+volatile uint32_t bytes_sent = 0;      // Отправлено байт (включая заголовки)
+volatile uint32_t encrypted_packets = 0;  // Зашифрованных пакетов
+uint32_t rtp_seq = 0;                  // RTP sequence number
+uint32_t rtp_ts = 0;                   // RTP timestamp
 
-bool wifi_configured = false;
-bool ap_mode = false;
+// Состояние WiFi
+bool wifi_configured = false;  // Конфигурация WiFi загружена
+bool ap_mode = false;          // Режим точки доступа активен
 
-// ==================== I2S КОНФИГУРАЦИЯ ====================
+// ==================== I2S КОНФИГУРАЦИЯ ВХОДА ====================
+// Конфигурация I2S для приёма аудио (микрофон/ADC)
 const i2s_config_t i2s_in_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8,
-    .dma_buf_len = 1024,
-    .use_apll = true,
-    .tx_desc_auto_clear = false,
-    .fixed_mclk = 0
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),  // Мастер, приём
+    .sample_rate = SAMPLE_RATE,                           // 16 kHz
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,         // 32-bit сэмплы
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,          // Моно (левый канал)
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,    // Стандартный I2S
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,             // Приоритет прерывания
+    .dma_buf_count = 8,                                   // 8 DMA буферов
+    .dma_buf_len = 1024,                                  // 1024 сэмплов каждый
+    .use_apll = true,                                     // APLL для точной частоты
+    .tx_desc_auto_clear = false,                          // Не актуально для RX
+    .fixed_mclk = 0                                       // MCLK не используется
 };
 
+// Распиновка I2S входа
 const i2s_pin_config_t pin_config_in = {
-    .mck_io_num = I2S_PIN_NO_CHANGE,
-    .bck_io_num = I2S_IN_SCK,
-    .ws_io_num = I2S_IN_WS,
-    .data_out_num = I2S_PIN_NO_CHANGE,
-    .data_in_num = I2S_IN_SD
+    .mck_io_num = I2S_PIN_NO_CHANGE,  // MCLK не подключён
+    .bck_io_num = I2S_IN_SCK,         // BCLK → GPIO 23
+    .ws_io_num = I2S_IN_WS,           // LRCLK → GPIO 22
+    .data_out_num = I2S_PIN_NO_CHANGE,  // Не используется для RX
+    .data_in_num = I2S_IN_SD          // SD → GPIO 21
 };
 
+// ==================== I2S КОНФИГУРАЦИЯ ВЫХОДА ====================
+// Конфигурация I2S для воспроизведения (ЦАП/усилитель)
 const i2s_config_t i2s_out_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 4,
-    .dma_buf_len = 512,
-    .use_apll = true,
-    .tx_desc_auto_clear = true,
-    .fixed_mclk = 0
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),  // Мастер, передача
+    .sample_rate = SAMPLE_RATE,                           // 16 kHz
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,         // 32-bit сэмплы
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,         // Стерео
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,    // Стандартный I2S
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,             // Приоритет прерывания
+    .dma_buf_count = 4,                                   // 4 DMA буфера
+    .dma_buf_len = 512,                                   // 512 сэмплов каждый
+    .use_apll = true,                                     // APLL для точной частоты
+    .tx_desc_auto_clear = true,                           // Автоочистка буферов
+    .fixed_mclk = 0                                       // MCLK не используется
 };
 
+// Распиновка I2S выхода
 const i2s_pin_config_t pin_config_out = {
-    .mck_io_num = I2S_PIN_NO_CHANGE,
-    .bck_io_num = I2S_OUT_BCK,
-    .ws_io_num = I2S_OUT_LRC,
-    .data_out_num = I2S_OUT_DATA,
-    .data_in_num = I2S_PIN_NO_CHANGE
+    .mck_io_num = I2S_PIN_NO_CHANGE,  // MCLK не подключён
+    .bck_io_num = I2S_OUT_BCK,        // BCLK → GPIO 26
+    .ws_io_num = I2S_OUT_LRC,         // LRCLK → GPIO 27
+    .data_out_num = I2S_OUT_DATA,     // SD → GPIO 25
+    .data_in_num = I2S_PIN_NO_CHANGE  // Не используется для TX
 };
 
 // ==================== LED ФУНКЦИИ ====================
+
+/**
+ * @brief Инициализация WS2812B LED ленты
+ * Настраивает FastLED, очищает светодиоды, инициализирует структуру состояния
+ */
 void initLED() {
-    FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
-    FastLED.setBrightness(LED_BRIGHTNESS);
+    FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);  // GRB порядок цветов
+    FastLED.setBrightness(LED_BRIGHTNESS);                    // Яркость 64/255
     FastLED.clear();
     FastLED.show();
+    
+    // Сброс состояния LED
     led_state.ws_connected = false;
     led_state.recording = false;
     led_state.recording_blink = false;
     led_state.recording_blink_time = 0;
     led_state.ws_blink_time = 0;
     led_state.ws_blink_state = false;
+    
     LOG("LED init");
 }
 
+/**
+ * @brief Установка цвета отдельного светодиода
+ * @param idx Индекс светодиода (0-2)
+ * @param color Цвет в формате CRGB
+ */
 void setLed(int idx, CRGB color) {
     if (idx >= 0 && idx < NUM_LEDS) leds[idx] = color;
 }
 
+/**
+ * @brief Установка одинакового цвета всех светодиодов с немедленным обновлением
+ * @param color Цвет в формате CRGB
+ */
 void setAllLeds(CRGB color) {
     for (int i = 0; i < NUM_LEDS; i++) leds[i] = color;
     FastLED.show();
 }
 
+/**
+ * @brief Полное выключение всех светодиодов
+ */
 void clearAllLeds() {
     FastLED.clear();
     FastLED.show();
 }
 
+/**
+ * @brief Анимация запуска: последовательное зажигание синим, затем белым
+ */
 void startupAnimation() {
-    for (int i = 0; i < NUM_LEDS; i++) { setLed(i, CRGB::Blue); FastLED.show(); delay(50); }
-    for (int i = NUM_LEDS - 1; i >= 0; i--) { setLed(i, CRGB::White); FastLED.show(); delay(50); }
+    // Прямой проход: синий
+    for (int i = 0; i < NUM_LEDS; i++) { 
+        setLed(i, CRGB::Blue); 
+        FastLED.show(); 
+        delay(50); 
+    }
+    // Обратный проход: белый
+    for (int i = NUM_LEDS - 1; i >= 0; i--) { 
+        setLed(i, CRGB::White); 
+        FastLED.show(); 
+        delay(50); 
+    }
     clearAllLeds();
 }
 
+/**
+ * @brief Сигнализация ошибки: мигание красным N раз
+ * @param count Количество миганий
+ */
 void errorBlink(int count) {
-    for (int i = 0; i < count; i++) { setAllLeds(CRGB::Red); delay(100); clearAllLeds(); delay(100); }
+    for (int i = 0; i < count; i++) { 
+        setAllLeds(CRGB::Red); 
+        delay(100); 
+        clearAllLeds(); 
+        delay(100); 
+    }
 }
 
+/**
+ * @brief Сигнализация успеха: однократное зелёное мигание
+ */
 void successBlink() {
-    setAllLeds(CRGB::Green); FastLED.show(); delay(150); clearAllLeds();
+    setAllLeds(CRGB::Green); 
+    FastLED.show(); 
+    delay(150); 
+    clearAllLeds();
 }
 
+/**
+ * @brief Обновление состояния светодиодов на основе текущих флагов
+ * Вызывается циклически в loop(), использует неблокирующие задержки
+ * 
+ * LED[0] STATUS: ⚪Idle / 🟢Playback / 🔴Recording (мигает)
+ * LED[1] WS: 🟦Connected / 🟡Disconnected (мигает)
+ * LED[2] RECORD: ⚫Off / 🟢Playback / 🔴Recording (постоянный)
+ */
 void updateLEDs() {
     uint32_t now = millis();
     
-    // LED[0] - Статус режима
+    // --- LED[0]: Статус режима ---
     if (led_state.recording) {
+        // Мигание красным при записи (500мс период)
         if (now - led_state.recording_blink_time >= 500) {
             led_state.recording_blink = !led_state.recording_blink;
             led_state.recording_blink_time = now;
         }
         setLed(LED_STATUS, led_state.recording_blink ? CRGB::Red : CRGB::Black);
     } else {
+        // Статичный цвет: зелёный (playback) или белый (idle)
         setLed(LED_STATUS, device_mode == MODE_PLAYBACK ? CRGB::Green : CRGB::White);
     }
     
-    // LED[1] - WebSocket
+    // --- LED[1]: WebSocket статус ---
     if (led_state.ws_connected) {
-        setLed(LED_WS, CRGB::Cyan);
+        setLed(LED_WS, CRGB::Cyan);  // Подключён — постоянный cyan
     } else {
+        // Мигание жёлтым при отсутствии подключения (400мс период)
         if (now - led_state.ws_blink_time >= 400) {
             led_state.ws_blink_state = !led_state.ws_blink_state;
             led_state.ws_blink_time = now;
@@ -256,50 +366,81 @@ void updateLEDs() {
         setLed(LED_WS, led_state.ws_blink_state ? CRGB::Yellow : CRGB::Black);
     }
     
-    // LED[2] - Запись/Воспроизведение
+    // --- LED[2]: Запись/Воспроизведение ---
     if (led_state.recording) {
-        setLed(LED_RECORD, CRGB::Red);
+        setLed(LED_RECORD, CRGB::Red);       // Запись — красный
     } else if (device_mode == MODE_PLAYBACK) {
-        setLed(LED_RECORD, CRGB::Green);
+        setLed(LED_RECORD, CRGB::Green);     // Playback — зелёный
     } else {
-        setLed(LED_RECORD, CRGB::Black);
+        setLed(LED_RECORD, CRGB::Black);     // Выключен
     }
     
-    FastLED.show();
+    FastLED.show();  // Физическое обновление ленты
 }
 
 // ==================== КРИПТОГРАФИЯ ====================
+
+/**
+ * @brief Вычисление SHA-256 хеша от строки
+ * @param input Входная строка (null-terminated)
+ * @param output Буфер для хеша (минимум 32 байта)
+ */
 void sha256_hash(const char* input, uint8_t* output) {
     mbedtls_sha256_context ctx;
     mbedtls_sha256_init(&ctx);
-    mbedtls_sha256_starts(&ctx, 0);
+    mbedtls_sha256_starts(&ctx, 0);  // 0 = SHA-256 (не SHA-224)
     mbedtls_sha256_update(&ctx, (const uint8_t*)input, strlen(input));
     mbedtls_sha256_finish(&ctx, output);
     mbedtls_sha256_free(&ctx);
 }
 
+/**
+ * @brief Генерация криптографически стойкого случайного PSK ключа
+ * Использует аппаратный генератор шума ESP32 через mbedtls entropy
+ * @param psk Буфер для ключа (минимум len байт)
+ * @param len Длина ключа в байтах
+ */
 void generate_psk(uint8_t* psk, size_t len) {
     mbedtls_ctr_drbg_context ctr_drbg;
     mbedtls_entropy_context entropy;
+    
     mbedtls_ctr_drbg_init(&ctr_drbg);
     mbedtls_entropy_init(&entropy);
-    mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const uint8_t*)"esp", 3);
+    
+    // Инициализация DRBG с персонализацией "esp"
+    mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, 
+                          (const uint8_t*)"esp", 3);
+    
+    // Генерация случайных байт
     mbedtls_ctr_drbg_random(&ctr_drbg, psk, len);
+    
     mbedtls_ctr_drbg_free(&ctr_drbg);
     mbedtls_entropy_free(&entropy);
 }
 
+/**
+ * @brief Преобразование binary PSK ключа в hex строку
+ * @param psk Binary ключ (PSK_LEN байт)
+ * @param hex Буфер для hex строки (PSK_HEX_LEN = 65 символов)
+ */
 void psk_to_hex(const uint8_t* psk, char* hex) {
     const char* hc = "0123456789abcdef";
     for (int i = 0; i < PSK_LEN; i++) {
-        hex[i*2] = hc[(psk[i] >> 4) & 0x0F];
-        hex[i*2+1] = hc[psk[i] & 0x0F];
+        hex[i*2] = hc[(psk[i] >> 4) & 0x0F];   // Старшая тетрада
+        hex[i*2+1] = hc[psk[i] & 0x0F];        // Младшая тетрада
     }
-    hex[PSK_HEX_LEN-1] = '\0';
+    hex[PSK_HEX_LEN-1] = '\0';  // Null-терминация
 }
 
+/**
+ * @brief Преобразование hex строки в binary PSK ключ
+ * @param hex Hex строка (64 символа)
+ * @param psk Буфер для binary ключа (PSK_LEN байт)
+ * @return true при успехе, false при неверном формате
+ */
 bool hex_to_psk(const char* hex, uint8_t* psk) {
-    if (strlen(hex) != PSK_LEN * 2) return false;
+    if (strlen(hex) != PSK_LEN * 2) return false;  // Должно быть 64 символа
+    
     for (int i = 0; i < PSK_LEN; i++) {
         uint8_t b = 0;
         for (int j = 0; j < 2; j++) {
@@ -307,24 +448,38 @@ bool hex_to_psk(const char* hex, uint8_t* psk) {
             if (c >= '0' && c <= '9') b = (b << 4) | (c - '0');
             else if (c >= 'a' && c <= 'f') b = (b << 4) | (c - 'a' + 10);
             else if (c >= 'A' && c <= 'F') b = (b << 4) | (c - 'A' + 10);
-            else return false;
+            else return false;  // Недопустимый символ
         }
         psk[i] = b;
     }
     return true;
 }
 
+/**
+ * @brief Шифрование аудио данных AES-128-CBC
+ * При выключенном SSL копирует данные без изменений
+ * IV формируется из RTP sequence number (Big-Endian) + часть PSK
+ * 
+ * @param data Входные данные (аудио буфер)
+ * @param len Длина входных данных
+ * @param output Буфер для зашифрованных данных (должен быть >= len + 16)
+ * @param out_len Фактическая длина выходных данных (с учётом padding)
+ */
 void encrypt_audio_data(uint8_t* data, size_t len, uint8_t* output, size_t* out_len) {
+    // Если шифрование отключено — простое копирование
     if (!config.ssl_enabled) {
         memcpy(output, data, len);
         *out_len = len;
         return;
     }
     
+    // Инициализация AES контекста
     mbedtls_aes_init(&dtls_aes_ctx);
-    mbedtls_aes_setkey_enc(&dtls_aes_ctx, config.psk, PSK_LEN * 8);
+    mbedtls_aes_setkey_enc(&dtls_aes_ctx, config.psk, PSK_LEN * 8);  // 256 бит
     
-    // ✅ IV в Big-Endian
+    // ✅ Формирование IV в Big-Endian формате:
+    // [0-3]: RTP sequence number (big-endian)
+    // [4-15]: Первые 12 байт PSK
     uint8_t iv[16] = {0};
     iv[0] = (rtp_seq >> 24) & 0xFF;
     iv[1] = (rtp_seq >> 16) & 0xFF;
@@ -332,17 +487,23 @@ void encrypt_audio_data(uint8_t* data, size_t len, uint8_t* output, size_t* out_
     iv[3] = rtp_seq & 0xFF;
     memcpy(iv + 4, config.psk, 12);
     
+    // Выравнивание длины по границе блока (16 байт)
     size_t pl = ((len + 15) / 16) * 16;
     uint8_t* pd = (uint8_t*)malloc(pl);
+    
     if (!pd) {
+        // Fallback при нехватке памяти
         memcpy(output, data, len);
         *out_len = len;
         mbedtls_aes_free(&dtls_aes_ctx);
         return;
     }
     
+    // Копирование данных и zero-padding
     memcpy(pd, data, len);
     memset(pd + len, 0, pl - len);
+    
+    // CBC шифрование
     mbedtls_aes_crypt_cbc(&dtls_aes_ctx, MBEDTLS_AES_ENCRYPT, pl, iv, pd, output);
     *out_len = pl;
     encrypted_packets++;

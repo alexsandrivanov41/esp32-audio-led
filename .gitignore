@@ -1,0 +1,38 @@
+```
+# Arduino build artifacts
+*.hex
+*.elf
+*.bin
+*.map
+*.sym
+
+# Build directories
+build/
+dist/
+
+# Dependencies
+libraries/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Python (if present in Arduino projects)
+__pycache__/
+*.pyc
+*.pyo
+```
